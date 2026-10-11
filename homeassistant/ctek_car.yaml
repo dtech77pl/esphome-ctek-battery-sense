@@ -1,0 +1,86 @@
+# =====================================================================
+# Home Assistant package for ONE CTEK (ctek_id: car)
+#
+# Install:
+#   1. configuration.yaml:   homeassistant:
+#                              packages: !include_dir_named packages
+#   2. copy this file to /config/packages/ctek_car.yaml
+#   3. for a second CTEK copy the file and replace every "car" with its ctek_id
+#      (event name, unique_id, entity ids, statistic id)
+#   4. restart Home Assistant (or reload Template entities + Automations)
+#
+# Result:
+#   sensor.ctek_car_history          state = number of stored records,
+#                                     attribute measurements = [[ts, V, C], ...]
+#                                     (last 5000 records, de-duplicated by ts)
+#   ctek_car:voltage_history         long-term statistics (hourly mean/min/max)
+#                                     -> use a statistics-graph card
+# =====================================================================
+template:
+  - triggers:
+      - trigger: event
+        event_type: esphome.ctek_car_history
+    sensor:
+      - name: "CTEK car history"
+        unique_id: ctek_car_history
+        icon: mdi:car-battery
+        state: >
+          {% set raw = trigger.event.data.measurements | default([], true) %}
+          {% set incoming = raw | from_json if raw is string else raw %}
+          {% set old_raw = this.attributes.get('measurements', []) %}
+          {% set old = old_raw | from_json if old_raw is string else (old_raw | default([], true)) %}
+          {{ ((old + incoming) | unique(attribute='0') | list) | length }}
+        attributes:
+          measurements: >
+            {% set raw = trigger.event.data.measurements | default([], true) %}
+            {% set incoming = raw | from_json if raw is string else raw %}
+            {% set old_raw = this.attributes.get('measurements', []) %}
+            {% set old = old_raw | from_json if old_raw is string else (old_raw | default([], true)) %}
+            {{ (((old + incoming) | unique(attribute='0') | sort(attribute='0') | list)[-5000:]) | to_json }}
+          last_packet_count: "{{ trigger.event.data.count | default(0) }}"
+          last_received: "{{ now().isoformat() }}"
+
+automation:
+  - id: ctek_car_statistics_archive
+    alias: "CTEK car - statistics archive"
+    description: >
+      On every history packet: recompute hourly mean/min/max for the hours
+      contained in the packet (from all records in sensor.ctek_car_history)
+      and import them as long-term statistics. Idempotent.
+    mode: queued
+    max: 50
+    triggers:
+      - trigger: event
+        event_type: esphome.ctek_car_history
+    actions:
+      # give the template sensor time to merge the packet
+      - delay:
+          seconds: 2
+      - variables:
+          stats: >
+            {% set raw = trigger.event.data.measurements | default('[]') %}
+            {% set inc = raw | from_json if raw is string else raw %}
+            {% set d = state_attr('sensor.ctek_car_history', 'measurements') | default([], true) %}
+            {% set data = d | from_json if d is string else d %}
+            {% set ns = namespace(h=[], out=[]) %}
+            {% for p in inc %}{% set g = ((p[0] | int) // 3600) * 3600 %}{% if g not in ns.h %}{% set ns.h = ns.h + [g] %}{% endif %}{% endfor %}
+            {% for g in ns.h | sort %}
+              {% set v = data | selectattr('0', 'ge', g) | selectattr('0', 'lt', g + 3600) | map(attribute='1') | select('gt', 5) | list %}
+              {% if v | length > 0 %}
+                {% set ns.out = ns.out + [{'start': g | timestamp_custom('%Y-%m-%d %H:%M:%S%z', true), 'mean': ((v | sum) / (v | length)) | round(3), 'min': v | min, 'max': v | max}] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out }}
+      - condition: template
+        value_template: "{{ stats | length > 0 }}"
+      # Syntax for HA 2026.8 - 2026.10. Newer versions: replace has_mean/has_sum
+      # with  mean_type: 1  and add  unit_class: voltage
+      - action: recorder.import_statistics
+        data:
+          statistic_id: ctek_car:voltage_history
+          source: ctek_car
+          name: "CTEK car voltage"
+          unit_of_measurement: "V"
+          has_mean: true
+          has_sum: false
+          stats: "{{ stats }}"

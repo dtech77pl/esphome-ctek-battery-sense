@@ -1,0 +1,58 @@
+# Example cards for ctek_id "car".
+# Card 1 needs apexcharts-card (HACS). Card 2 is built in.
+
+# 1) last 48 h from the CTEK memory + live value
+type: custom:apexcharts-card
+graph_span: 48h
+span:
+  end: minute
+header:
+  show: true
+  title: CTEK car - last 48 h
+  show_states: true
+yaxis:
+  - id: v
+    min: ~11.8
+    max: ~14.6
+    decimals: 2
+series:
+  - entity: sensor.ctek_car_history
+    name: CTEK memory
+    yaxis_id: v
+    stroke_width: 3
+    extend_to: false
+    show:
+      in_header: false
+    data_generator: |
+      let data = entity.attributes.measurements || [];
+      if (typeof data === 'string') data = JSON.parse(data);
+      const out = [];
+      let prev = null;
+      data.forEach(it => {
+        const ts = Number(it[0]) * 1000;
+        // break the line on gaps longer than 3 log periods (1 min period)
+        if (prev !== null && ts - prev > 3 * 60 * 1000) out.push([prev + 1000, null]);
+        out.push([ts, Number(it[1])]);
+        prev = ts;
+      });
+      return out;
+  # live sensor from ESPHome: sensor.<esphome device name>_<ctek_name>_voltage
+  - entity: sensor.ctek_gateway_ctek_car_voltage
+    name: live
+    yaxis_id: v
+    curve: stepline
+    extend_to: false
+    show:
+      in_header: raw
+
+---
+# 2) long-term archive (hourly)
+type: statistics-graph
+title: CTEK car - 30 days
+days_to_show: 30
+period: hour
+chart_type: line
+stat_types: [mean, min, max]
+entities:
+  - entity: ctek_car:voltage_history
+    name: CTEK car

@@ -1,0 +1,45 @@
+# Minimal ESP32 gateway for ONE CTEK Battery Sense.
+# Put this file next to ctek-battery-sense.yaml in your ESPHome config folder.
+esphome:
+  name: ctek-gateway
+  friendly_name: CTEK gateway
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    # Optional for ESP32 chip rev >= 3.0 (the boot log tells you):
+    # advanced:
+    #   minimum_chip_revision: "3.1"
+    #   sram1_as_iram: true
+
+logger:
+
+api:
+  encryption:
+    key: !secret ctek_gateway_api_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+packages:
+  car: !include
+    file: ctek-battery-sense.yaml
+    vars:
+      ctek_id: car
+      ctek_name: "CTEK Car"
+      ctek_mac: "AA:BB:CC:DD:EE:FF"       # BLE MAC of your CTEK
+      ctek_code: "XXXXXXXXXXXXXXXX"       # 16 characters under the barcode
+      ctek_skip_existing: "false"         # "true" = do not import records already in the CTEK
+
+sensor:
+  - platform: template
+    name: "Free heap"
+    unit_of_measurement: "KiB"
+    entity_category: diagnostic
+    lambda: "return heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024.0;"
+    update_interval: 60s

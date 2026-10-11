@@ -1,0 +1,543 @@
+# =====================================================================
+# CTEK Battery Sense -> ESPHome -> Home Assistant (live values + history)
+#
+# Reusable ESPHome package. Include it once per CTEK device:
+#
+#   packages:
+#     car1: !include
+#       file: ctek-battery-sense.yaml
+#       vars:
+#         ctek_id: car1                 # short, unique, [a-z0-9_] only
+#         ctek_name: "CTEK Car1"        # prefix for entity names
+#         ctek_mac: "AA:BB:CC:DD:EE:FF" # BLE MAC of the CTEK
+#         ctek_code: "XXXXXXXXXXXXXXXX" # 16-char code from the barcode sticker
+#         ctek_skip_existing: "false"   # "true" = ignore records already in CTEK memory
+#
+# What it does
+#   * connects to the CTEK, unlocks it (MD5 of a fixed salt + sticker code,
+#     computed on the ESP), then encrypts the link (Just Works bonding)
+#   * live voltage + temperature
+#   * downloads the CTEK's internal history (the CTEK logs one record every
+#     N minutes into its own memory, also while the car is away) and sends
+#     every record to HA as event  esphome.ctek_<ctek_id>_history
+#     data: measurements = [[unix_ts, volts, celsius], ...] (max 20 per event)
+#   * keeps the last 240 records in RAM and re-sends them after every HA
+#     reconnect (HA de-duplicates by timestamp), so an HA restart loses nothing
+#   * lets you read / change the CTEK logging period (1-60 min)
+#     WARNING: changing the period ERASES the history stored in the CTEK
+#
+# Requirements: ESP32 with esp-idf framework, ESPHome 2026.x (tested 2026.9.1).
+# The ESP must be allowed to perform Home Assistant actions
+# (Settings > Devices & services > ESPHome > device > Configure).
+#
+# Protocol details: ../docs/PROTOCOL.md
+# =====================================================================
+
+esp32_ble:
+  io_capability: none
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: false
+
+time:
+  - platform: homeassistant
+    id: ${ctek_id}_time
+
+globals:
+  # GATT handles, captured on connect (ESPHome releases the service list later)
+  - id: ${ctek_id}_h_cccd
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: ${ctek_id}_h_range
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: ${ctek_id}_h_period
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: ${ctek_id}_period_props
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: ${ctek_id}_ready
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # next record index to download (survives ESP reboots)
+  - id: ${ctek_id}_next
+    type: int
+    restore_value: yes
+    initial_value: "0"
+  - id: ${ctek_id}_first_start
+    type: bool
+    restore_value: yes
+    initial_value: "${ctek_skip_existing}"
+  # time anchor: record (anchor_n - 1) was written at about anchor_t
+  - id: ${ctek_id}_anchor_n
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: ${ctek_id}_anchor_t
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: ${ctek_id}_period_min
+    type: int
+    restore_value: no
+    initial_value: "5"
+  # running range request
+  - id: ${ctek_id}_req_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: ${ctek_id}_req_first
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: ${ctek_id}_req_count
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: ${ctek_id}_req_got
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: ${ctek_id}_req_start
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  # send queue [ts, V, C]
+  - id: ${ctek_id}_q_ts
+    type: std::vector<uint32_t>
+    restore_value: no
+  - id: ${ctek_id}_q_v
+    type: std::vector<float>
+    restore_value: no
+  - id: ${ctek_id}_q_t
+    type: std::vector<float>
+    restore_value: no
+  - id: ${ctek_id}_sent
+    type: int
+    restore_value: no
+    initial_value: "0"
+  # last 240 records, re-sent after every HA (re)connect
+  - id: ${ctek_id}_buf_ts
+    type: std::vector<uint32_t>
+    restore_value: no
+  - id: ${ctek_id}_buf_v
+    type: std::vector<float>
+    restore_value: no
+  - id: ${ctek_id}_buf_t
+    type: std::vector<float>
+    restore_value: no
+  # HA API connection tracking
+  - id: ${ctek_id}_api_was
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: ${ctek_id}_api_since
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: ${ctek_id}_resend
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+ble_client:
+  - mac_address: "${ctek_mac}"
+    id: ${ctek_id}_ble
+    auto_connect: true
+    on_connect:
+      then:
+        # 1. capture handles before ESPHome releases the service list
+        - lambda: |-
+            namespace espbt = esphome::esp32_ble_tracker;
+            auto svc = espbt::ESPBTUUID::from_raw("812ca8ed-a177-4d74-aefa-70098c5416af");
+            id(${ctek_id}_h_cccd) = 0;
+            id(${ctek_id}_h_range) = 0;
+            id(${ctek_id}_h_period) = 0;
+            auto *smp = id(${ctek_id}_ble)->get_characteristic(svc,
+              espbt::ESPBTUUID::from_raw("a337b4eb-2544-4f94-87c9-f7732e5fe250"));
+            if (smp != nullptr) {
+              auto *d = smp->get_descriptor(espbt::ESPBTUUID::from_uint16(0x2902));
+              if (d != nullptr) id(${ctek_id}_h_cccd) = d->handle;
+            }
+            auto *rng = id(${ctek_id}_ble)->get_characteristic(svc,
+              espbt::ESPBTUUID::from_raw("418d1817-f516-45f1-ab64-433ae596613d"));
+            if (rng != nullptr) id(${ctek_id}_h_range) = rng->handle;
+            auto *per = id(${ctek_id}_ble)->get_characteristic(svc,
+              espbt::ESPBTUUID::from_raw("e5a7e9a0-e2d7-4f46-83d1-0e55d2427780"));
+            if (per != nullptr) {
+              id(${ctek_id}_h_period) = per->handle;
+              id(${ctek_id}_period_props) = per->properties;
+            }
+            ESP_LOGI("ctek.${ctek_id}", "[1] connected, CCCD=%u RANGE=%u PERIOD=%u",
+                     (unsigned) id(${ctek_id}_h_cccd), (unsigned) id(${ctek_id}_h_range),
+                     (unsigned) id(${ctek_id}_h_period));
+        - delay: 300ms
+        # 2. UNLOCK: MD5(salt + sticker code) -> a1d67c01 (write with response)
+        #    must happen BEFORE encryption, otherwise the CTEK drops the link
+        - ble_client.ble_write:
+            id: ${ctek_id}_ble
+            service_uuid: "812ca8ed-a177-4d74-aefa-70098c5416af"
+            characteristic_uuid: "a1d67c01-fe3f-01bf-7d49-7dbdc43b02a6"
+            value: !lambda |-
+              static const uint8_t SALT[16] = {0xE1, 0xDA, 0x71, 0x95, 0xEC, 0xED, 0x40, 0xE4,
+                                               0xBC, 0x16, 0x55, 0x9E, 0x9D, 0xE7, 0x3B, 0xA4};
+              std::string code = "${ctek_code}";
+              std::string norm;
+              for (char c : code) {
+                if (c == ' ') continue;
+                norm += (char) toupper((unsigned char) c);
+              }
+              if (norm.size() != 16) {
+                ESP_LOGE("ctek.${ctek_id}", "ctek_code must be 16 characters, got %u", (unsigned) norm.size());
+              }
+              md5::MD5Digest md5;
+              md5.init();
+              md5.add(SALT, sizeof(SALT));
+              md5.add((const uint8_t *) norm.data(), norm.size());
+              md5.calculate();
+              std::vector<uint8_t> out(16);
+              md5.get_bytes(out.data());
+              ESP_LOGI("ctek.${ctek_id}", "[2] unlock for code %s", norm.c_str());
+              return out;
+        - delay: 1s
+        # 3. Encrypt the link (bonding, Just Works). Bluedroid does not do
+        #    this automatically: without it every read fails with status=15.
+        - lambda: |-
+            esp_ble_auth_req_t auth = ESP_LE_AUTH_REQ_SC_BOND;
+            esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth, sizeof(auth));
+            esp_ble_io_cap_t io = ESP_IO_CAP_NONE;
+            esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &io, sizeof(io));
+            auto st = esp_ble_set_encryption(id(${ctek_id}_ble)->get_remote_bda(), ESP_BLE_SEC_ENCRYPT);
+            ESP_LOGI("ctek.${ctek_id}", "[3] encryption: %s", st == ESP_OK ? "requested" : esp_err_to_name(st));
+        - delay: 3s
+        # 4. enable notifications on the sample characteristic
+        - lambda: |-
+            if (id(${ctek_id}_h_cccd) == 0) {
+              ESP_LOGW("ctek.${ctek_id}", "[4] no CCCD handle");
+              return;
+            }
+            uint8_t v[2] = {0x01, 0x00};
+            auto st = esp_ble_gattc_write_char_descr(
+              id(${ctek_id}_ble)->get_gattc_if(), id(${ctek_id}_ble)->get_conn_id(),
+              id(${ctek_id}_h_cccd), 2, v, ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+            ESP_LOGI("ctek.${ctek_id}", "[4] notifications: %s", st == ESP_OK ? "on" : esp_err_to_name(st));
+        - delay: 500ms
+        - lambda: |-
+            id(${ctek_id}_anchor_n) = -1;   // fresh time anchor from next cursor read
+            id(${ctek_id}_ready) = true;
+            id(${ctek_id}_req_active) = false;
+            ESP_LOGI("ctek.${ctek_id}", "[5] ready, next record to fetch: %d", id(${ctek_id}_next));
+        - component.update: ${ctek_id}_period
+        - component.update: ${ctek_id}_temp
+        - component.update: ${ctek_id}_cursor
+    on_disconnect:
+      then:
+        - lambda: |-
+            id(${ctek_id}_ready) = false;
+            id(${ctek_id}_req_active) = false;
+            ESP_LOGW("ctek.${ctek_id}", "disconnected");
+
+interval:
+  # request missing history records, max 18 per request
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (!id(${ctek_id}_ready) || id(${ctek_id}_h_range) == 0 || id(${ctek_id}_anchor_n) < 0) return;
+          if (id(${ctek_id}_req_active)) {
+            if (millis() - id(${ctek_id}_req_start) > 8000) {
+              ESP_LOGW("ctek.${ctek_id}", "request %d+%d timed out, got %d",
+                       id(${ctek_id}_req_first), id(${ctek_id}_req_count), id(${ctek_id}_req_got));
+              id(${ctek_id}_next) = id(${ctek_id}_req_first) + std::max(id(${ctek_id}_req_got), 1);
+              id(${ctek_id}_req_active) = false;
+            }
+            return;
+          }
+          int n = id(${ctek_id}_anchor_n);
+          if (n < id(${ctek_id}_next)) {
+            ESP_LOGW("ctek.${ctek_id}", "CTEK cursor (%d) < next (%d): CTEK memory was reset, starting from 0",
+                     n, id(${ctek_id}_next));
+            id(${ctek_id}_next) = 0;
+          }
+          int left = n - id(${ctek_id}_next);
+          if (left <= 0) return;
+          int cnt = std::min(left, 18);
+          int f = id(${ctek_id}_next);
+          uint8_t req[5] = {3, (uint8_t) (f & 0xFF), (uint8_t) (f >> 8),
+                            (uint8_t) (cnt & 0xFF), (uint8_t) (cnt >> 8)};
+          auto st = esp_ble_gattc_write_char(
+            id(${ctek_id}_ble)->get_gattc_if(), id(${ctek_id}_ble)->get_conn_id(),
+            id(${ctek_id}_h_range), sizeof(req), req, ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+          if (st != ESP_OK) {
+            ESP_LOGW("ctek.${ctek_id}", "range request failed: %s", esp_err_to_name(st));
+            return;
+          }
+          id(${ctek_id}_req_first) = f;
+          id(${ctek_id}_req_count) = cnt;
+          id(${ctek_id}_req_got) = 0;
+          id(${ctek_id}_req_start) = millis();
+          id(${ctek_id}_req_active) = true;
+          ESP_LOGI("ctek.${ctek_id}", "requesting records %d..%d (cursor %d)", f, f + cnt - 1, n);
+
+  # track the HA API connection; after (re)connect wait 10 s (HA must
+  # subscribe to events first) and re-queue the last 240 records
+  - interval: 200ms
+    then:
+      - lambda: |-
+          // HA = a client with state subscription (log viewers do not count)
+          bool c = api::global_api_server != nullptr &&
+                   api::global_api_server->is_connected_with_state_subscription();
+          if (c && !id(${ctek_id}_api_was)) {
+            id(${ctek_id}_api_since) = millis();
+            id(${ctek_id}_resend) = true;
+          }
+          id(${ctek_id}_api_was) = c;
+          if (c && id(${ctek_id}_resend) && millis() - id(${ctek_id}_api_since) > 10000) {
+            id(${ctek_id}_resend) = false;
+            if (!id(${ctek_id}_buf_ts).empty()) {
+              id(${ctek_id}_q_ts).insert(id(${ctek_id}_q_ts).begin(), id(${ctek_id}_buf_ts).begin(), id(${ctek_id}_buf_ts).end());
+              id(${ctek_id}_q_v).insert(id(${ctek_id}_q_v).begin(), id(${ctek_id}_buf_v).begin(), id(${ctek_id}_buf_v).end());
+              id(${ctek_id}_q_t).insert(id(${ctek_id}_q_t).begin(), id(${ctek_id}_buf_t).begin(), id(${ctek_id}_buf_t).end());
+              ESP_LOGI("ctek.${ctek_id}", "re-sending %u buffered records after HA connect",
+                       (unsigned) id(${ctek_id}_buf_ts).size());
+            }
+          }
+      - if:
+          condition:
+            lambda: |-
+              return id(${ctek_id}_api_was) && millis() - id(${ctek_id}_api_since) > 10000
+                     && !id(${ctek_id}_q_ts).empty();
+          then:
+            - homeassistant.event:
+                event: esphome.ctek_${ctek_id}_history
+                data:
+                  measurements: !lambda |-
+                    size_t n = std::min((size_t) 20, id(${ctek_id}_q_ts).size());
+                    std::string json = "[";
+                    for (size_t i = 0; i < n; i++) {
+                      if (i) json += ",";
+                      char item[48];
+                      snprintf(item, sizeof(item), "[%u,%.3f,%.1f]", (unsigned) id(${ctek_id}_q_ts)[i],
+                               id(${ctek_id}_q_v)[i], id(${ctek_id}_q_t)[i]);
+                      json += item;
+                    }
+                    return json + "]";
+                  count: !lambda |-
+                    return to_string((unsigned) std::min((size_t) 20, id(${ctek_id}_q_ts).size()));
+            - lambda: |-
+                size_t n = std::min((size_t) 20, id(${ctek_id}_q_ts).size());
+                id(${ctek_id}_q_ts).erase(id(${ctek_id}_q_ts).begin(), id(${ctek_id}_q_ts).begin() + n);
+                id(${ctek_id}_q_v).erase(id(${ctek_id}_q_v).begin(), id(${ctek_id}_q_v).begin() + n);
+                id(${ctek_id}_q_t).erase(id(${ctek_id}_q_t).begin(), id(${ctek_id}_q_t).begin() + n);
+                id(${ctek_id}_sent) += n;
+                ESP_LOGI("ctek.${ctek_id}", "sent %u records to HA (queued: %u)",
+                         (unsigned) n, (unsigned) id(${ctek_id}_q_ts).size());
+
+sensor:
+  # samples characteristic (notify only): history records + live voltage
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${ctek_id}_ble
+    name: "${ctek_name} voltage"
+    id: ${ctek_id}_voltage
+    service_uuid: "812ca8ed-a177-4d74-aefa-70098c5416af"
+    characteristic_uuid: "a337b4eb-2544-4f94-87c9-f7732e5fe250"
+    notify: true
+    update_interval: never
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    lambda: |-
+      float last_v = NAN;
+      for (size_t o = 0; o + 2 < x.size(); o += 3) {
+        uint16_t raw = (uint16_t) x[o] | ((uint16_t) x[o + 1] << 8);
+        float v = raw / 2048.0f;
+        float t = (int8_t) x[o + 2] / 2.0f;
+        if (id(${ctek_id}_req_active)) {
+          int idx = id(${ctek_id}_req_first) + id(${ctek_id}_req_got);
+          id(${ctek_id}_req_got) += 1;
+          // record (anchor_n - 1) ~ anchor_t, older ones every period_min minutes
+          uint32_t ts = id(${ctek_id}_anchor_t) -
+              (uint32_t) (id(${ctek_id}_anchor_n) - 1 - idx) * (uint32_t) id(${ctek_id}_period_min) * 60u;
+          if (v > 5.0f && v < 20.0f) {
+            id(${ctek_id}_q_ts).push_back(ts);
+            id(${ctek_id}_q_v).push_back(v);
+            id(${ctek_id}_q_t).push_back(t);
+            id(${ctek_id}_buf_ts).push_back(ts);
+            id(${ctek_id}_buf_v).push_back(v);
+            id(${ctek_id}_buf_t).push_back(t);
+            if (id(${ctek_id}_buf_ts).size() > 240) {
+              id(${ctek_id}_buf_ts).erase(id(${ctek_id}_buf_ts).begin());
+              id(${ctek_id}_buf_v).erase(id(${ctek_id}_buf_v).begin());
+              id(${ctek_id}_buf_t).erase(id(${ctek_id}_buf_t).begin());
+            }
+          }
+          ESP_LOGI("ctek.${ctek_id}", "record %d: %.3f V, %.1f C, ts %u", idx, v, t, (unsigned) ts);
+          if (id(${ctek_id}_req_got) >= id(${ctek_id}_req_count)) {
+            id(${ctek_id}_next) = id(${ctek_id}_req_first) + id(${ctek_id}_req_count);
+            id(${ctek_id}_req_active) = false;
+          }
+          if (idx == id(${ctek_id}_anchor_n) - 1) {
+            last_v = v;
+            id(${ctek_id}_temp_record).publish_state(t);
+          }
+        } else {
+          last_v = v;
+          id(${ctek_id}_temp_record).publish_state(t);
+        }
+      }
+      return last_v;
+    filters:
+      - filter_out: nan
+
+  - platform: template
+    name: "${ctek_name} temperature (record)"
+    id: ${ctek_id}_temp_record
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${ctek_id}_ble
+    name: "${ctek_name} temperature"
+    id: ${ctek_id}_temp
+    service_uuid: "812ca8ed-a177-4d74-aefa-70098c5416af"
+    characteristic_uuid: "b5634099-97c4-4f37-adf3-771246e77754"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      if (x.empty()) return NAN;
+      return (int8_t) x[0] / 2.0f;
+
+  # record cursor (= number of records in CTEK memory), polled every 5 s;
+  # sets the time anchor whenever it changes. Only changes go to HA.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${ctek_id}_ble
+    name: "${ctek_name} records in memory"
+    id: ${ctek_id}_cursor
+    service_uuid: "812ca8ed-a177-4d74-aefa-70098c5416af"
+    characteristic_uuid: "fc3119da-9b40-414e-a1c4-6c1737718cae"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (x.size() < 2) return NAN;
+      int n = (int) ((uint16_t) x[0] | ((uint16_t) x[1] << 8));
+      auto now = id(${ctek_id}_time).now();
+      if (!now.is_valid()) {
+        ESP_LOGW("ctek.${ctek_id}", "no time from HA yet - waiting");
+        return (float) n;
+      }
+      if (id(${ctek_id}_first_start)) {
+        id(${ctek_id}_first_start) = false;
+        id(${ctek_id}_next) = n;
+        ESP_LOGI("ctek.${ctek_id}", "first start: skipping %d existing records", n);
+      }
+      if (n != id(${ctek_id}_anchor_n)) {
+        id(${ctek_id}_anchor_n) = n;
+        id(${ctek_id}_anchor_t) = (uint32_t) now.timestamp;
+        ESP_LOGI("ctek.${ctek_id}", "cursor %d, anchor %u", n, (unsigned) id(${ctek_id}_anchor_t));
+      }
+      return (float) n;
+    filters:
+      - delta: 0.5
+
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${ctek_id}_ble
+    name: "${ctek_name} log period"
+    id: ${ctek_id}_period
+    service_uuid: "812ca8ed-a177-4d74-aefa-70098c5416af"
+    characteristic_uuid: "e5a7e9a0-e2d7-4f46-83d1-0e55d2427780"
+    entity_category: diagnostic
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    update_interval: 600s
+    lambda: |-
+      if (x.empty() || x[0] == 0) return NAN;
+      id(${ctek_id}_period_min) = x[0];
+      return (float) x[0];
+
+  - platform: template
+    name: "${ctek_name} records sent"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: "return id(${ctek_id}_sent);"
+    update_interval: 60s
+
+  - platform: template
+    name: "${ctek_name} next record"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: "return id(${ctek_id}_next);"
+    update_interval: 60s
+
+  - platform: ble_client
+    type: rssi
+    ble_client_id: ${ctek_id}_ble
+    name: "${ctek_name} RSSI"
+    entity_category: diagnostic
+    update_interval: 60s
+
+number:
+  # WARNING: writing a new period erases the history stored in the CTEK
+  - platform: template
+    name: "${ctek_name} set log period"
+    id: ${ctek_id}_period_set
+    icon: "mdi:timer-cog-outline"
+    entity_category: config
+    unit_of_measurement: "min"
+    min_value: 1
+    max_value: 60
+    step: 1
+    mode: box
+    update_interval: 60s
+    lambda: "return (float) id(${ctek_id}_period_min);"
+    set_action:
+      - lambda: |-
+          if (!id(${ctek_id}_ready) || id(${ctek_id}_h_period) == 0) {
+            ESP_LOGW("ctek.${ctek_id}", "not connected - period not written");
+            return;
+          }
+          uint8_t p = id(${ctek_id}_period_props);
+          esp_gatt_write_type_t typ;
+          if (p & ESP_GATT_CHAR_PROP_BIT_WRITE) typ = ESP_GATT_WRITE_TYPE_RSP;
+          else if (p & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) typ = ESP_GATT_WRITE_TYPE_NO_RSP;
+          else {
+            ESP_LOGW("ctek.${ctek_id}", "period characteristic is not writable (0x%02X)", p);
+            return;
+          }
+          uint8_t v = (uint8_t) x;
+          auto st = esp_ble_gattc_write_char(
+            id(${ctek_id}_ble)->get_gattc_if(), id(${ctek_id}_ble)->get_conn_id(),
+            id(${ctek_id}_h_period), 1, &v, typ, ESP_GATT_AUTH_REQ_NONE);
+          ESP_LOGI("ctek.${ctek_id}", "writing period %u min: %s", (unsigned) v,
+                   st == ESP_OK ? "sent" : esp_err_to_name(st));
+      - delay: 2s
+      - component.update: ${ctek_id}_period
+
+button:
+  # download the whole CTEK memory again (records already in HA may be
+  # duplicated with timestamps shifted by up to one period)
+  - platform: template
+    name: "${ctek_name} re-download history"
+    entity_category: config
+    on_press:
+      then:
+        - lambda: |-
+            id(${ctek_id}_next) = 0;
+            id(${ctek_id}_req_active) = false;
+            ESP_LOGI("ctek.${ctek_id}", "re-downloading history from record 0");
