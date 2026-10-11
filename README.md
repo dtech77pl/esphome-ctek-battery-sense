@@ -35,7 +35,8 @@ into its own memory                  reads cursor, requests missing       → te
                                      records, timestamps them, sends ──►  → automation → long-term statistics
 ```
 
-<img src="docs/ctek.jpg" alt="CTEK Battery Sense on the battery" width="400">
+<img src="docs/ctek.jpg" alt="Home Assistant dashboard with CTEK Battery Sense history" width="400">
+
 
 Records have no timestamp inside the CTEK. The ESP polls the record counter
 every 5 s; when it increases, the newest record is "now" and older ones are one
