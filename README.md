@@ -29,10 +29,16 @@ the garage on mains power.
 ## How it works
 
 ```
-CTEK (in the car)                        ESP32 (garage)                         Home Assistant
-logs 1 record / N min   ── BLE ──►   unlock → encrypt → notify            event esphome.ctek_<id>_history
-into its own memory                  reads cursor, requests missing       → template sensor (records)
-                                     records, timestamps them, sends ──►  → automation → long-term statistics
+CTEK (in the car)     logs 1 record / N min into its own memory
+      │ BLE
+      ▼
+ESP32 (garage)        unlock → encrypt → read record counter
+      │               → request missing records → add timestamps
+      │ ESPHome API
+      ▼
+Home Assistant        event esphome.ctek_<id>_history
+                      → template sensor (records)
+                      → automation → long-term statistics
 ```
 
 <img src="docs/ctek.jpg" alt="Home Assistant dashboard with CTEK Battery Sense history" width="400">
