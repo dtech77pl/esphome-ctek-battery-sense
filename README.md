@@ -82,6 +82,25 @@ packages:
       ctek_skip_existing: "false"     # "true" = don't import records already in the CTEK
 ```
 
+Or include it straight from GitHub (no files to copy):
+
+```yaml
+packages:
+  car:
+    url: https://github.com/dtech77pl/esphome-ctek-battery-sense
+    ref: main
+    files:
+      - path: esphome/ctek-battery-sense.yaml
+        vars:
+          ctek_id: car
+          ctek_name: "CTEK Car"
+          ctek_mac: "AA:BB:CC:DD:EE:FF"
+          ctek_code: "XXXXXXXXXXXXXXXX"
+          ctek_skip_existing: "false"
+```
+
+
+
 The package can be added to an ESP32 that already does other things (ours also
 drives a 433 MHz battery disconnect switch). Enabling Bluetooth took about
 105 KiB of heap on our ESP32 (175 → 69 KiB free); the second CTEK cost another
